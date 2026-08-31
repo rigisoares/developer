@@ -1,0 +1,148 @@
+name: CI/CD - Provisionar RDS e Executar Scripts SQL
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: "us-east-1"
+  DB_INSTANCE_IDENTIFIER: "rds-sqlserver-dados"
+  DB_INSTANCE_CLASS: "db.t3.micro"
+  DB_STORAGE_SIZE: 20
+  DB_ENGINE: "sqlserver-ex"
+
+jobs:
+  deploy-database:
+    name: Provisionar RDS e Aplicar DDL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 3. Obter IP Público do Runner
+        id: get-ip
+        run: |
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+          echo "runner_ip=$RUNNER_IP" >> $GITHUB_OUTPUT
+          echo "Runner IP: $RUNNER_IP"
+
+      - name: 4. Criar ou Atualizar Security Group
+        id: sec-group
+        run: |
+          SG_NAME="rds-sqlserver-github-sg"
+          
+          # Verifica se o Security Group já existe
+          SG_ID=$(aws ec2 describe-security-groups \
+            --group-names "$SG_NAME" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$SG_ID" ] || [ "$SG_ID" == "None" ]; then
+            echo "Criando Security Group: $SG_NAME..."
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "Acesso temporario GitHub Actions para RDS SQL Server" \
+              --query 'GroupId' \
+              --output text)
+          fi
+
+          echo "Liberando porta 1433 para o IP: ${{ steps.get-ip.outputs.runner_ip }}/32"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 1433 \
+            --cidr "${{ steps.get-ip.outputs.runner_ip }}/32" || true
+
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: 5. Provisionar Instância RDS SQL Server
+        run: |
+          echo "Verificando se a instancia RDS já existe..."
+          STATUS=$(aws rds describe-db-instances \
+            --db-instance-identifier ${{ env.DB_INSTANCE_IDENTIFIER }} \
+            --query "DBInstances[0].DBInstanceStatus" \
+            --output text 2>/dev/null || echo "not-found")
+
+          if [ "$STATUS" == "not-found" ]; then
+            echo "Criando instancia RDS ${{ env.DB_INSTANCE_IDENTIFIER }}..."
+            aws rds create-db-instance \
+              --db-instance-identifier ${{ env.DB_INSTANCE_IDENTIFIER }} \
+              --db-instance-class ${{ env.DB_INSTANCE_CLASS }} \
+              --engine ${{ env.DB_ENGINE }} \
+              --allocated-storage ${{ env.DB_STORAGE_SIZE }} \
+              --master-username "${{ secrets.DB_USER }}" \
+              --master-user-password "${{ secrets.DB_PASSWORD }}" \
+              --vpc-security-group-ids "${{ steps.sec-group.outputs.sg_id }}" \
+              --publicly-accessible \
+              --no-multi-az \
+              --backup-retention-period 0
+          else
+            echo "Instância já existente (Status: $STATUS). Pulando criação."
+          fi
+
+          echo "Aguardando o RDS ficar disponível..."
+          aws rds wait db-instance-available --db-instance-identifier ${{ env.DB_INSTANCE_IDENTIFIER }}
+
+      - name: 6. Obter Endpoint de Conexão do RDS
+        id: get-endpoint
+        run: |
+          ENDPOINT=$(aws rds describe-db-instances \
+            --db-instance-identifier ${{ env.DB_INSTANCE_IDENTIFIER }} \
+            --query "DBInstances[0].Endpoint.Address" \
+            --output text)
+          echo "db_endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "RDS Endpoint: $ENDPOINT"
+
+      - name: 7. Instalar Ferramentas MSSQL (sqlcmd)
+        run: |
+          sudo curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/22.04/prod.list)"
+          sudo apt-get update -y
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+          echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
+
+      - name: 8. Executar Scripts SQL da Pasta Script/
+        env:
+          DB_ENDPOINT: ${{ steps.get-endpoint.outputs.db_endpoint }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          echo "=== EXECUTANDO SCRIPTS SQL NO BANCO ==="
+          
+          SCRIPTS=$(find Script/ -type f -iname "*.sql" | sort)
+
+          if [ -z "$SCRIPTS" ]; then
+            echo "❌ Nenhum arquivo .sql foi encontrado dentro da pasta 'Script/'!"
+            exit 1
+          fi
+
+          for script in $SCRIPTS; do
+            echo "--------------------------------------------------"
+            echo "Executando: $script"
+            echo "--------------------------------------------------"
+            
+            sqlcmd -S "$DB_ENDPOINT" \
+                   -U "$DB_USER" \
+                   -P "$DB_PASSWORD" \
+                   -d "master" \
+                   -i "$script" \
+                   -C \
+                   -b
+
+            if [ $? -ne 0 ]; then
+              echo "❌ Erro ao executar: $script"
+              exit 1
+            fi
+          done
+          
+          echo "🎉 TODOS OS SCRIPTS SQL FORAM EXECUTADOS COM SUCESSO!"
