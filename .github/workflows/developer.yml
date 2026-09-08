@@ -119,7 +119,7 @@ jobs:
         run: |
           echo "=== EXECUTANDO SCRIPTS SQL NO BANCO ==="
           
-          SCRIPTS=$(find Script/ -type f -iname "*.sql" | sort)
+          SCRIPTS=$(find scripts/ -type f -iname "*.sql" | sort)
 
           if [ -z "$SCRIPTS" ]; then
             echo "❌ Nenhum arquivo .sql foi encontrado dentro da pasta 'Script/'!"
